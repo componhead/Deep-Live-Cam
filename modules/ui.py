@@ -77,6 +77,11 @@ from modules.utilities import (
 from modules import imread_unicode
 from modules.video_capture import VideoCapturer
 
+try:
+    import pyvirtualcam
+except ImportError:
+    pyvirtualcam = None
+
 if platform.system() == "Windows":
     from pygrabber.dshow_graph import FilterGraph
 
@@ -92,6 +97,11 @@ PREVIEW_MAX_HEIGHT = 700
 PREVIEW_MAX_WIDTH = 1200
 PREVIEW_DEFAULT_WIDTH = 640
 PREVIEW_DEFAULT_HEIGHT = 360
+
+# v4l2loopback device the live-swapped feed is mirrored to, so apps like Zoom
+# can use it directly as a webcam without going through a screen-capture tool.
+# Set to "" to disable. Override with the DLC_VIRTUAL_CAM_DEVICE env var.
+VIRTUAL_CAM_DEVICE = os.environ.get("DLC_VIRTUAL_CAM_DEVICE", "/dev/video10")
 
 POPUP_WIDTH = 750
 POPUP_HEIGHT = 810
@@ -1142,12 +1152,14 @@ class _CaptureWorker(QThread):
 class _ProcessingWorker(QThread):
     """Pulls raw frames, runs detect/swap/enhance, pushes processed frames."""
 
-    def __init__(self, capture_queue, processed_queue, stop_event, camera_fps: float):
+    def __init__(self, capture_queue, processed_queue, stop_event, camera_fps: float,
+                 virtual_cam=None):
         super().__init__()
         self._cq = capture_queue
         self._pq = processed_queue
         self._stop = stop_event
         self._fps = camera_fps
+        self._vcam = virtual_cam
 
     def run(self) -> None:
         frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
@@ -1264,6 +1276,12 @@ class _ProcessingWorker(QThread):
                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2,
                 )
 
+            if self._vcam is not None:
+                try:
+                    self._vcam.send(gpu_cvt_color(temp_frame, cv2.COLOR_BGR2RGB))
+                except Exception as e:
+                    print(f"[virtualcam] send failed: {e}")
+
             try:
                 self._pq.put_nowait(temp_frame)
             except queue.Full:
@@ -1302,6 +1320,20 @@ class WebcamPreviewWindow(QWidget):
             f"{self._cap.actual_height}@{camera_fps:.0f}fps"
         )
 
+        self._vcam = None
+        if pyvirtualcam is not None and VIRTUAL_CAM_DEVICE:
+            try:
+                self._vcam = pyvirtualcam.Camera(
+                    width=self._cap.actual_width,
+                    height=self._cap.actual_height,
+                    fps=round(camera_fps) or 30,
+                    device=VIRTUAL_CAM_DEVICE,
+                    fmt=pyvirtualcam.PixelFormat.RGB,
+                )
+                print(f"[virtualcam] Mirroring live feed to {VIRTUAL_CAM_DEVICE}")
+            except Exception as e:
+                print(f"[virtualcam] Could not open {VIRTUAL_CAM_DEVICE}: {e}")
+
         self._capture_queue: queue.Queue = queue.Queue(maxsize=2)
         self._processed_queue: queue.Queue = queue.Queue(maxsize=2)
         self._stop_event = threading.Event()
@@ -1310,7 +1342,8 @@ class WebcamPreviewWindow(QWidget):
             self._cap, self._capture_queue, self._stop_event
         )
         self._processing_worker = _ProcessingWorker(
-            self._capture_queue, self._processed_queue, self._stop_event, camera_fps
+            self._capture_queue, self._processed_queue, self._stop_event, camera_fps,
+            virtual_cam=self._vcam,
         )
         self._capture_worker.start()
         self._processing_worker.start()
@@ -1347,6 +1380,11 @@ class WebcamPreviewWindow(QWidget):
             self._cap.release()
         except Exception:
             pass
+        if self._vcam is not None:
+            try:
+                self._vcam.close()
+            except Exception:
+                pass
         global _WEBCAM_PREVIEW
         if _WEBCAM_PREVIEW is self:
             _WEBCAM_PREVIEW = None
