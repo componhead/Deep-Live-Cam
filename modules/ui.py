@@ -1153,13 +1153,16 @@ class _ProcessingWorker(QThread):
     """Pulls raw frames, runs detect/swap/enhance, pushes processed frames."""
 
     def __init__(self, capture_queue, processed_queue, stop_event, camera_fps: float,
-                 virtual_cam=None):
+                 virtual_cam=None, swap_enabled: threading.Event | None = None):
         super().__init__()
         self._cq = capture_queue
         self._pq = processed_queue
         self._stop = stop_event
         self._fps = camera_fps
         self._vcam = virtual_cam
+        self._swap_enabled = swap_enabled or threading.Event()
+        if swap_enabled is None:
+            self._swap_enabled.set()
 
     def run(self) -> None:
         frame_processors = get_frame_processors_modules(modules.globals.frame_processors)
@@ -1184,7 +1187,9 @@ class _ProcessingWorker(QThread):
             if modules.globals.live_mirror:
                 temp_frame = gpu_flip(temp_frame, 1)
 
-            if not modules.globals.map_faces:
+            if not self._swap_enabled.is_set():
+                pass
+            elif not modules.globals.map_faces:
                 if (
                     modules.globals.source_path
                     and modules.globals.source_path != last_source_path
@@ -1302,6 +1307,16 @@ class WebcamPreviewWindow(QWidget):
         self.resize(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+
+        self._swap_enabled = threading.Event()
+        self._swap_enabled.set()
+        self._cb_swap_enabled = QCheckBox("Swap attivo")
+        self._cb_swap_enabled.setChecked(True)
+        self._cb_swap_enabled.toggled.connect(
+            lambda checked: self._swap_enabled.set() if checked else self._swap_enabled.clear()
+        )
+        layout.addWidget(self._cb_swap_enabled)
+
         self._image_label = QLabel()
         self._image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._image_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -1343,7 +1358,7 @@ class WebcamPreviewWindow(QWidget):
         )
         self._processing_worker = _ProcessingWorker(
             self._capture_queue, self._processed_queue, self._stop_event, camera_fps,
-            virtual_cam=self._vcam,
+            virtual_cam=self._vcam, swap_enabled=self._swap_enabled,
         )
         self._capture_worker.start()
         self._processing_worker.start()
